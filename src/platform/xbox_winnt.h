@@ -153,15 +153,16 @@ typedef void             **PHANDLE, **LPHANDLE;
 typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
 typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
- 
-#ifdef __linux__
-/* On gcc these data structures are necessary  even if anyone is going to be used*/
+/* PCONTEXT: Windows VEH register state.
+ *
+ * This whole branch is the non-Windows host. Callers dereference EFlags (the
+ * AC'97 and watch handlers), so the record has to be a struct on Linux and
+ * on macOS. Gating it on __linux__ left Apple Clang with `typedef void
+ * *PCONTEXT`, and the Mac build died on `ep->ContextRecord->EFlags`. */
 typedef union Register{
 	uint32_t X; // all register
 	uint8_t SR[4]; // Subregister
-} REG; 
+} REG;
 
 typedef uint32_t  IREG;
 
@@ -179,9 +180,6 @@ typedef struct ProcessorCONTEXT{
 	IREG EIP;
 	IREG EFlags;
 } *PCONTEXT;
-#else
-typedef void              *PCONTEXT;
-#endif
 /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
 typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
 typedef const uint16_t    *LPCWSTR, *PCWSTR;

@@ -432,21 +432,17 @@ VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
 VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
 
-/* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
- * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
- * ucontext_t; for now we accept the registration and never fire. 
- * 
- * Note: GCC needs correct struct. This is from nxdk
- * */
-#ifdef __linux__
+/* Win32 VEH. AddVectoredExceptionHandler is still a stub on POSIX: registration
+ * is accepted and the handler is not fired from a signal. The record itself
+ * cannot be opaque. ac97_write_veh and watch_veh read ExceptionRecord and
+ * ContextRecord, and that code is compiled for every host. GCC and Apple
+ * Clang both need the struct; gating it on __linux__ made the Mac build fail
+ * with "member reference base type 'void'". The layout is the nxdk one. */
 typedef struct _EXCEPTION_POINTERS
 {
     PEXCEPTION_RECORD ExceptionRecord;
     PCONTEXT ContextRecord;
 } EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
-#else
-typedef void *PEXCEPTION_POINTERS;
-#endif
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
