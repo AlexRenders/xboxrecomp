@@ -8,6 +8,7 @@ stuck in.
 
 ## Start Here
 
+- [Golden Rules](GOLDEN_RULES.md) — What stays in the toolkit, and what stays in a title
 - [Getting Started](GETTING_STARTED.md) — End-to-end walkthrough from XBE to a running title
 - [Decompilation Guide](DECOMP.md) — Using the toolkit as a function splitter instead: one byte-exact `.s` per function, with signatures and the call graph
 - [Runtime Implementation Guide](runtime/README.md) — The four pillars every title needs: memory layout, kernel, graphics, input
@@ -44,6 +45,7 @@ One per stage, in the order you run them.
 
 - [D3D8 to D3D11 Translation](technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
 - [NV2A Shader Translation](technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
+- [Mac OpenGL bring-up log](technical/mac-gl-log.md) — What the POSIX backend learned from a native Mac port, and what a frame still needs
 - [D3D8LTCG Device Context](technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
 
 ### Microsoft's own recompiler
@@ -56,6 +58,7 @@ One per stage, in the order you run them.
 
 ### Project
 
+- [Golden Rules](GOLDEN_RULES.md) — Title-agnostic rules for the runtime and for bring-up
 - [Lessons Learned](technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
 - [Candidate Games](technical/candidate-games.md) — Choosing a target, tiered by difficulty
@@ -100,6 +103,7 @@ Where to look when a title does something and says nothing about why.
 | crashes on its first movie | [Library sections with no functions at all](pipeline/02-disassembly.md#library-sections-with-no-functions-at-all) |
 | fails to build on `dr0`–`dr7` | [Privileged Registers](pipeline/04-lifting.md#privileged-registers) |
 | ignores an override in `recomp_manual.c` | [Replace, Don't Wrap](pipeline/05-runtime.md#replace-dont-wrap), [Registers in recomp_manual.c](pipeline/05-runtime.md#registers-in-recomp_manualc) |
+| opens a window and never draws | [Mac OpenGL bring-up log](technical/mac-gl-log.md), [Golden Rules](GOLDEN_RULES.md) |
 | duplicates `NtCurrentThread()` forever | [Pseudo-Handles Are Negative](technical/kernel-replacement.md#pseudo-handles-are-negative) |
 | runs out of memory as the CRT heap grows | [The Heap Grows Only on 487](technical/kernel-replacement.md#the-heap-grows-only-on-487) |
 | slows to 1 FPS some minutes into a level | [Counters Outlive 32 Bits](technical/kernel-replacement.md#counters-outlive-32-bits) |

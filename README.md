@@ -303,6 +303,7 @@ xboxrecomp/
 ## Documentation
 
 ### Start Here
+- **[Golden Rules](docs/GOLDEN_RULES.md)** — What stays in the toolkit, and what stays in a title
 - **[Getting Started Guide](docs/GETTING_STARTED.md)** — End-to-end walkthrough from XBE to running game
 - **[Documentation Index](docs/INDEX.md)** — Every document in one place, and the same pages again by symptom
 - **[Decompilation Guide](docs/DECOMP.md)** — Using this as a function splitter instead: one byte-exact `.s` per function, with signatures and the call graph. You never run the recompiler
@@ -331,6 +332,7 @@ xboxrecomp/
 - [Indirect Call Dispatch](docs/technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
 - [D3D8 to D3D11 Translation](docs/technical/d3d-translation.md) — Bridging Xbox's graphics API to modern DirectX
 - [NV2A Shader Translation](docs/technical/nv2a-shaders.md) — Register combiners and vertex microcode to HLSL
+- [Mac OpenGL bring-up log](docs/technical/mac-gl-log.md) — POSIX GLSL vertex programs, Apple GL limits, and what a frame still needs
 - [D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md) — Device field map, PB ring management, stub calling conventions
 - [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
