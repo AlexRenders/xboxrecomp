@@ -834,6 +834,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (fd < 0) {
         int e = errno;
+        fprintf(stderr, "  [FILE] miss xbox='%s' host='%s' errno=%d\n",
+                xbox_path ? xbox_path : "", host_path, e);
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;

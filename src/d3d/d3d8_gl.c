@@ -15,14 +15,16 @@
  *   - DrawPrimitive(UP) / DrawIndexedPrimitive(UP) with a fixed GLSL program
  *     supporting position + diffuse + UV (the FVF set the recompiled RW
  *     driver actually emits at this point)
+ *   - NV2A vertex-shader bytecode to GLSL (nv2a_glsl.c), used when the
+ *     title calls D3DDevice_CreateVertexShader
  *
- * Next iterations: real texture-format mapping, FVF-driven input layouts
- * beyond pos/diffuse/UV, Xbox VSH bytecode → GLSL, register-combiner
- * pixel programs → GLSL fragment.
+ * Register-combiner pixel programs are still the fixed modulate. Halo's
+ * combiner translator indexes a private state array, not these D3DRS values.
  */
 
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
+#include "nv2a_glsl.h"
 
 #include <SDL.h>
 #include <epoxy/gl.h>
@@ -31,6 +33,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 #ifndef D3D_OK
 #define D3D_OK ((HRESULT)0)
@@ -99,7 +105,22 @@ typedef struct {
     GLint            u_use_tex;
     GLint            u_use_xform;
     GLint            u_tex0;
+
+    float            vsc[NV2A_GLSL_CONSTANTS][4];
 } D3DGL;
+
+#define NV2A_VS_SLOTS 64
+
+typedef struct {
+    int      used;
+    uint32_t *code;
+    unsigned insn_count;
+    GLuint   prog;
+    int      compile_failed;
+    GLint    u_c, u_scale, u_offset, u_point, u_screen, u_tex, u_use_tex;
+} Nv2aSlot;
+
+static Nv2aSlot g_vs[NV2A_VS_SLOTS];
 
 static D3DGL g;
 
@@ -699,7 +720,7 @@ static void setup_fvf_attribs(DWORD fvf, UINT stride)
     }
 }
 
-static void bind_texture0(void)
+static void bind_texture0_to(GLint loc_tex, GLint loc_use)
 {
     int use_tex = 0;
     GLTexture *t = (GLTexture *)g.textures[0];
@@ -712,8 +733,130 @@ static void bind_texture0(void)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,     GL_REPEAT);
         use_tex = 1;
     }
-    glUniform1i(g.u_tex0, 0);
-    glUniform1i(g.u_use_tex, use_tex);
+    if (loc_tex >= 0)
+        glUniform1i(loc_tex, 0);
+    if (loc_use >= 0)
+        glUniform1i(loc_use, use_tex);
+}
+
+static void bind_texture0(void)
+{
+    bind_texture0_to(g.u_tex0, g.u_use_tex);
+}
+
+/* Apple's GL waits inside glBufferSubData when the previous frame is still
+ * reading that buffer. A fresh allocation does not. */
+static void stream_upload(GLenum target, GLuint buf, GLsizeiptr *cap,
+                          GLsizeiptr size, const void *data)
+{
+    glBindBuffer(target, buf);
+    glBufferData(target, size, data, GL_STREAM_DRAW);
+    *cap = size;
+}
+
+static const char *NV2A_FS_SRC =
+#if defined(__APPLE__)
+    "#version 410 core\n"
+#else
+    "#version 330 core\n"
+#endif
+    "in vec4 xD0;\n"
+    "in vec4 xT0;\n"
+    "uniform int u_use_tex;\n"
+    "uniform sampler2D u_tex0;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "  vec4 c = xD0;\n"
+    "  if (u_use_tex != 0) c *= texture(u_tex0, xT0.xy);\n"
+    "  frag_color = c;\n"
+    "}\n";
+
+static Nv2aSlot *nv2a_slot(DWORD handle)
+{
+    unsigned i;
+    if (!(handle & 0x80000000u))
+        return NULL;
+    i = handle & 0x7fffffffu;
+    if (i == 0 || i > NV2A_VS_SLOTS)
+        return NULL;
+    if (!g_vs[i - 1].used)
+        return NULL;
+    return &g_vs[i - 1];
+}
+
+static int nv2a_ensure(Nv2aSlot *s)
+{
+    char *src;
+    GLuint vs, fs;
+
+    if (s->prog || s->compile_failed)
+        return s->prog != 0;
+    src = nv2a_vertex_shader_to_glsl(s->code, s->insn_count, 0);
+    if (!src) {
+        s->compile_failed = 1;
+        return 0;
+    }
+    vs = compile_shader(GL_VERTEX_SHADER, src);
+    free(src);
+    fs = compile_shader(GL_FRAGMENT_SHADER, NV2A_FS_SRC);
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        s->compile_failed = 1;
+        return 0;
+    }
+    s->prog = link_program(vs, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!s->prog) {
+        s->compile_failed = 1;
+        return 0;
+    }
+    s->u_c = glGetUniformLocation(s->prog, "c");
+    s->u_scale = glGetUniformLocation(s->prog, "viewport_scale");
+    s->u_offset = glGetUniformLocation(s->prog, "viewport_offset");
+    s->u_point = glGetUniformLocation(s->prog, "point_size");
+    s->u_screen = glGetUniformLocation(s->prog, "screen_offset");
+    s->u_tex = glGetUniformLocation(s->prog, "u_tex0");
+    s->u_use_tex = glGetUniformLocation(s->prog, "u_use_tex");
+    return 1;
+}
+
+/* 1 when an NV2A program is bound. 0 falls back to the fixed FVF shader. */
+static int bind_nv2a_program(void)
+{
+    Nv2aSlot *s = nv2a_slot(g.current_vsh);
+    D3DVIEWPORT8 vp;
+    float scale[4], offset[4];
+
+    if (!s || !nv2a_ensure(s))
+        return 0;
+    glUseProgram(s->prog);
+    if (s->u_c >= 0)
+        glUniform4fv(s->u_c, NV2A_GLSL_CONSTANTS, &g.vsc[0][0]);
+    vp = g.viewport;
+    if (vp.Width == 0 || vp.Height == 0) {
+        vp.X = 0;
+        vp.Y = 0;
+        vp.Width = (DWORD)g.backbuf_w;
+        vp.Height = (DWORD)g.backbuf_h;
+        vp.MinZ = 0.f;
+        vp.MaxZ = 1.f;
+    }
+    scale[0] = vp.Width * 0.5f;
+    scale[1] = vp.Height * 0.5f;
+    scale[2] = (vp.MaxZ != vp.MinZ) ? (vp.MaxZ - vp.MinZ) : 1.f;
+    scale[3] = 1.f;
+    offset[0] = vp.X + vp.Width * 0.5f;
+    offset[1] = vp.Y + vp.Height * 0.5f;
+    offset[2] = vp.MinZ;
+    offset[3] = 0.f;
+    if (s->u_scale >= 0) glUniform4fv(s->u_scale, 1, scale);
+    if (s->u_offset >= 0) glUniform4fv(s->u_offset, 1, offset);
+    if (s->u_point >= 0) glUniform1f(s->u_point, 1.f);
+    if (s->u_screen >= 0) glUniform1f(s->u_screen, 0.f);
+    bind_texture0_to(s->u_tex, s->u_use_tex);
+    return 1;
 }
 
 static void update_mvp(DWORD fvf)
@@ -734,18 +877,16 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *s, D3DPRIMITIVETY
     UINT vcount = 0;
     GLenum mode = gl_prim(pt, prim_count, &vcount);
     GLsizeiptr size = (GLsizeiptr)vcount * stride;
-    glUseProgram(g.prog);
+    int nv2a = bind_nv2a_program();
+    if (!nv2a)
+        glUseProgram(g.prog);
     glBindVertexArray(g.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g.stream_vbo);
-    if (size > g.stream_vbo_size) {
-        glBufferData(GL_ARRAY_BUFFER, size, verts, GL_STREAM_DRAW);
-        g.stream_vbo_size = size;
-    } else {
-        glBufferSubData(GL_ARRAY_BUFFER, 0, size, verts);
-    }
+    stream_upload(GL_ARRAY_BUFFER, g.stream_vbo, &g.stream_vbo_size, size, verts);
     setup_fvf_attribs(g.current_fvf, stride);
-    bind_texture0();
-    update_mvp(g.current_fvf);
+    if (!nv2a) {
+        bind_texture0();
+        update_mvp(g.current_fvf);
+    }
     apply_render_states();
     glDrawArrays(mode, 0, (GLsizei)vcount);
     return D3D_OK;
@@ -762,17 +903,17 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *s, D3DPRIM
     GLenum itype = (idx_fmt == D3DFMT_INDEX32) ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
     GLsizeiptr ibytes = (GLsizeiptr)icount * ((itype == GL_UNSIGNED_INT) ? 4 : 2);
     GLsizeiptr vbytes = (GLsizeiptr)nv * stride;
-    glUseProgram(g.prog);
+    int nv2a = bind_nv2a_program();
+    if (!nv2a)
+        glUseProgram(g.prog);
     glBindVertexArray(g.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g.stream_vbo);
-    if (vbytes > g.stream_vbo_size) { glBufferData(GL_ARRAY_BUFFER, vbytes, verts, GL_STREAM_DRAW); g.stream_vbo_size = vbytes; }
-    else glBufferSubData(GL_ARRAY_BUFFER, 0, vbytes, verts);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.stream_ibo);
-    if (ibytes > g.stream_ibo_size) { glBufferData(GL_ELEMENT_ARRAY_BUFFER, ibytes, idx, GL_STREAM_DRAW); g.stream_ibo_size = ibytes; }
-    else glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, ibytes, idx);
+    stream_upload(GL_ARRAY_BUFFER, g.stream_vbo, &g.stream_vbo_size, vbytes, verts);
+    stream_upload(GL_ELEMENT_ARRAY_BUFFER, g.stream_ibo, &g.stream_ibo_size, ibytes, idx);
     setup_fvf_attribs(g.current_fvf, stride);
-    bind_texture0();
-    update_mvp(g.current_fvf);
+    if (!nv2a) {
+        bind_texture0();
+        update_mvp(g.current_fvf);
+    }
     apply_render_states();
     glDrawElements(mode, (GLsizei)icount, itype, 0);
     return D3D_OK;
@@ -908,7 +1049,51 @@ static HRESULT __stdcall dev_GetVertexShader(IDirect3DDevice8 *s, DWORD *p)
 { (void)s; if (p) *p = g.current_vsh; return D3D_OK; }
 static HRESULT __stdcall dev_SetVertexShaderConstant(IDirect3DDevice8 *s, INT reg,
                                                       const void *p, DWORD n)
-{ (void)s;(void)reg;(void)p;(void)n; return D3D_OK; }
+{
+    (void)s;
+    if (!p || reg < 0 || (DWORD)reg >= NV2A_GLSL_CONSTANTS)
+        return D3DERR_INVALIDCALL;
+    if ((DWORD)reg + n > NV2A_GLSL_CONSTANTS)
+        n = NV2A_GLSL_CONSTANTS - (DWORD)reg;
+    memcpy(g.vsc[reg], p, n * sizeof(g.vsc[0]));
+    return D3D_OK;
+}
+
+HRESULT D3DDevice_CreateVertexShader(const DWORD *declaration, const DWORD *function,
+                                     DWORD *handle, DWORD usage)
+{
+    unsigned slot, insns, i;
+
+    (void)declaration;
+    (void)usage;
+    if (!handle || !function)
+        return D3DERR_INVALIDCALL;
+    slot = NV2A_VS_SLOTS;
+    for (i = 0; i < NV2A_VS_SLOTS; i++) {
+        if (!g_vs[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == NV2A_VS_SLOTS)
+        return D3DERR_INVALIDCALL;
+    insns = 0;
+    for (i = 0; i < 136; i++) {
+        insns++;
+        if (function[i * 4 + 3] & 1)
+            break;
+    }
+    g_vs[slot].code = (uint32_t *)malloc(insns * 4 * sizeof(uint32_t));
+    if (!g_vs[slot].code)
+        return D3DERR_INVALIDCALL;
+    memcpy(g_vs[slot].code, function, insns * 4 * sizeof(uint32_t));
+    g_vs[slot].insn_count = insns;
+    g_vs[slot].used = 1;
+    g_vs[slot].prog = 0;
+    g_vs[slot].compile_failed = 0;
+    *handle = 0x80000000u | (slot + 1);
+    return D3D_OK;
+}
 static HRESULT __stdcall dev_SetPixelShader(IDirect3DDevice8 *s, DWORD h)
 { (void)s; g.current_psh = h; return D3D_OK; }
 static HRESULT __stdcall dev_GetPixelShader(IDirect3DDevice8 *s, DWORD *p)
@@ -975,7 +1160,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     (void)s; (void)adapter; (void)devtype; (void)hwnd; (void)flags;
     if (!pp || !pPP) return D3DERR_INVALIDCALL;
 
-    /* Initialise SDL video + GL 3.3 core context. */
+    /* GL 4.1 is the newest Apple ships. Everywhere else stays on 3.3. */
     if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
 
     g.backbuf_w = (int)pPP->BackBufferWidth;
@@ -983,8 +1168,13 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     if (g.backbuf_w <= 0) g.backbuf_w = 640;
     if (g.backbuf_h <= 0) g.backbuf_h = 480;
 
+#if defined(__APPLE__)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+#endif
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,  SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
@@ -1006,7 +1196,14 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
         return D3DERR_INVALIDCALL;
     }
     SDL_GL_MakeCurrent(g.window, g.glctx);
+#if defined(__APPLE__)
+    /* SDL's swap wait needs the main-thread run loop. The title draws on
+     * another thread, so vsync here stalls the wrong one. The host loop
+     * presents the window. */
+    SDL_GL_SetSwapInterval(0);
+#else
     SDL_GL_SetSwapInterval(1);
+#endif
 
     fprintf(stderr, "[d3d8_gl] GL %s / GLSL %s\n",
             glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
@@ -1048,6 +1245,153 @@ IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion)
 {
     (void)SDKVersion;
     return &g_d3d8;
+}
+
+/* Size the title asked for. The main thread applies it; the game thread
+ * only stores it. */
+static atomic_uint g_req_w;
+static atomic_uint g_req_h;
+static atomic_int g_req_gen;
+static int g_applied_gen;
+static int g_host_loop;
+
+static void host_note_size(unsigned width, unsigned height)
+{
+    if (width < 16 || width > 1920)
+        width = 640;
+    if (height < 16 || height > 1080)
+        height = 480;
+    atomic_store_explicit(&g_req_w, width, memory_order_relaxed);
+    atomic_store_explicit(&g_req_h, height, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_req_gen, 1, memory_order_release);
+}
+
+static void host_present_clear(void)
+{
+    if (!g.window || !g.glctx)
+        return;
+    SDL_GL_MakeCurrent(g.window, g.glctx);
+    glClearColor(0.04f, 0.05f, 0.07f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    SDL_GL_SwapWindow(g.window);
+}
+
+static int host_create_window(unsigned width, unsigned height)
+{
+    D3DPRESENT_PARAMETERS pp;
+    IDirect3DDevice8 *dev = NULL;
+    IDirect3D8 *d3d;
+    HRESULT hr;
+
+    if (g.window)
+        return 1;
+    host_note_size(width, height);
+    width = atomic_load_explicit(&g_req_w, memory_order_relaxed);
+    height = atomic_load_explicit(&g_req_h, memory_order_relaxed);
+
+    memset(&pp, 0, sizeof(pp));
+    pp.BackBufferWidth = width;
+    pp.BackBufferHeight = height;
+
+    d3d = xbox_Direct3DCreate8(0);
+    hr = d3d->lpVtbl->CreateDevice(d3d, 0, 1, NULL, 0, &pp, &dev);
+    fprintf(stderr, "[d3d8_gl] host device %ux%u hr=0x%08X\n",
+            width, height, (unsigned)hr);
+    if (hr != D3D_OK || !g.window)
+        return 0;
+    host_present_clear();
+    SDL_RaiseWindow(g.window);
+    g_applied_gen = atomic_load_explicit(&g_req_gen, memory_order_acquire);
+    return 1;
+}
+
+void d3d8_HostOpenWindow(void)
+{
+    host_create_window(640, 480);
+}
+
+void d3d8_HostCreateDevice(unsigned width, unsigned height)
+{
+    host_note_size(width, height);
+    fprintf(stderr, "[d3d8_gl] title wants %ux%u\n",
+            atomic_load_explicit(&g_req_w, memory_order_relaxed),
+            atomic_load_explicit(&g_req_h, memory_order_relaxed));
+    /* The window belongs to the thread that is pumping it. */
+#if defined(__APPLE__)
+    if (!pthread_main_np())
+        return;
+#endif
+    if (!g.window)
+        host_create_window(width, height);
+}
+
+static void host_apply_size(void)
+{
+    int gen = atomic_load_explicit(&g_req_gen, memory_order_acquire);
+    unsigned w, h;
+
+    if (gen == g_applied_gen || !g.window)
+        return;
+    w = atomic_load_explicit(&g_req_w, memory_order_relaxed);
+    h = atomic_load_explicit(&g_req_h, memory_order_relaxed);
+    g_applied_gen = gen;
+    if ((int)w == g.backbuf_w && (int)h == g.backbuf_h)
+        return;
+    g.backbuf_w = (int)w;
+    g.backbuf_h = (int)h;
+    SDL_SetWindowSize(g.window, g.backbuf_w, g.backbuf_h);
+    glViewport(0, 0, g.backbuf_w, g.backbuf_h);
+    fprintf(stderr, "[d3d8_gl] window resized to %ux%u\n", w, h);
+}
+
+static void host_pump_events(void)
+{
+    SDL_Event ev;
+    static int close_logged;
+
+    if (!g.window)
+        return;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT ||
+            (ev.type == SDL_WINDOWEVENT &&
+             ev.window.event == SDL_WINDOWEVENT_CLOSE)) {
+            if (!close_logged) {
+                fprintf(stderr, "[d3d8_gl] close ignored; window stays up\n");
+                close_logged = 1;
+            }
+            SDL_ShowWindow(g.window);
+            SDL_RaiseWindow(g.window);
+        }
+    }
+}
+
+void d3d8_HostMainLoop(volatile int *done)
+{
+    if (!g.window)
+        host_create_window(640, 480);
+    g_host_loop = 1;
+    fprintf(stderr, "[d3d8_gl] main thread owns the window\n");
+    while (!done || !*done) {
+        host_pump_events();
+        host_apply_size();
+        if (g.window)
+            host_present_clear();
+        else
+            SDL_Delay(16);
+    }
+    g_host_loop = 0;
+}
+
+void d3d8_HostPump(void)
+{
+    if (!g.window || g_host_loop)
+        return;
+    /* macOS delivers window events on the thread that created it. */
+#if defined(__APPLE__)
+    if (!pthread_main_np())
+        return;
+#endif
+    host_pump_events();
 }
 
 IDirect3DDevice8 *xbox_GetD3DDevice(void)

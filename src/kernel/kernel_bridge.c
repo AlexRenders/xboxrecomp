@@ -1347,6 +1347,16 @@ static void bridge_HalReturnToFirmware(void)
             routine);
     fflush(stderr);
 
+    /* Bring-up only. A title that cannot find xonlinedash.xbe reboots to the
+     * system dashboard. Returning lets that caller keep going so the campaign
+     * path can be seen. A real quit still ends the process when this is unset. */
+    if (getenv("RECOMP_NO_EXIT")) {
+        fprintf(stderr, "  [KERNEL] RECOMP_NO_EXIT set; returning to the title\n");
+        fflush(stderr);
+        g_eax = 0;
+        return;
+    }
+
     /* Write the indirect-branch targets before the process goes away. This
      * path ends in ExitProcess, which does not run atexit handlers, so the
      * host's registered dump never fires -- and a title that gives up during
@@ -9393,6 +9403,10 @@ void guest_cpu_part(void)
 
 /* A guest thread lets go of the guest CPU for the length of every kernel
  * call. */
+/* Defined by the OpenGL backend. Weak so a Windows link, or a title that
+ * does not draw, leaves the call out. */
+extern void d3d8_HostPump(void) __attribute__((weak));
+
 static void kernel_thunk_dispatch(void)
 {
     int held = t_guest_held;
@@ -9403,6 +9417,10 @@ static void kernel_thunk_dispatch(void)
     t_dispatch_depth++;
     kernel_thunk_dispatch_body();
     t_dispatch_depth--;
+    /* The title's own D3D never enters this backend. Pumping here is what
+     * keeps the host window alive between the CreateDevice hook and a frame. */
+    if (t_dispatch_depth == 0 && d3d8_HostPump)
+        d3d8_HostPump();
     /* Back to guest code: take the CPU again. Only at the outermost call --
      * a guest callback a bridge runs (an APC) returns into the bridge, not to
      * the thread's own code -- and only if the thread still exists as one. */

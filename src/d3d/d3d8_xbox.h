@@ -1161,6 +1161,29 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  */
 void d3d8_PresentFrame(void);
 
+/**
+ * Open the host window for a title whose D3D8 is linked into the XBE.
+ * The lifted CreateDevice still runs; this is the picture. Width or height
+ * of 0 picks 640x480. A second call is ignored.
+ */
+void d3d8_HostCreateDevice(unsigned width, unsigned height);
+
+/**
+ * Open the host window on the Mac main thread, before the title runs.
+ * Cocoa drops a window whose thread stops answering; the title must not
+ * be that thread.
+ */
+void d3d8_HostOpenWindow(void);
+
+/**
+ * Pump and present until *done becomes non-zero. Call on the thread that
+ * opened the window.
+ */
+void d3d8_HostMainLoop(volatile int *done);
+
+/** Poll the host window. No-op until d3d8_HostCreateDevice has succeeded. */
+void d3d8_HostPump(void);
+
 #ifdef __cplusplus
 }
 #endif

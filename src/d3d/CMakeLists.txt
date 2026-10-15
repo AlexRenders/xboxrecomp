@@ -20,6 +20,7 @@ if(WIN32)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
+        nv2a_glsl.c
     )
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)
