@@ -140,6 +140,9 @@ name a title.
   relaunch loop. `RECOMP_AC97_READY` sets the bit. On POSIX it no longer
   traps the APU pages, because the MMIO decoder (`src/apu/apu_mmio_hook.c`)
   is a Windows VEH and a trapped page there is just a crash.
+- **DSP command words.** `xbox_DspAckAdd(va)` adds to the same list as
+  `RECOMP_DSP_ACK`, for a title override that can compute the block address
+  at run time (DirectSound's command word is `*(*(this+8)+0x10) + 0x810`).
 - **Still open on POSIX:** the AC'97 bus-master reset. DirectSound writes RR
   (bit 1) to a channel control byte at NABM `+0x0B`, reads it once (the
   compiler hoisted the load), and spins on that value. The Windows answer is

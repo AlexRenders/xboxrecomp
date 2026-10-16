@@ -195,6 +195,11 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
  * first runs; a relaunch rewinds them there, as a reboot clears RAM. */
 void xbox_MemorySaveAllocators(void);
 void xbox_MemoryRestoreAllocators(void);
+
+/* Zero this guest word whenever it turns non-zero: a DSP command block's
+ * completion flag, for titles whose DirectSound waits on a DSP that is a stub.
+ * Same list as RECOMP_DSP_ACK. */
+void xbox_DspAckAdd(uint32_t va);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,

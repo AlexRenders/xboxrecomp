@@ -470,6 +470,24 @@ static void dsp_ack_init(void)
                         " immediately\n", g_dsp_ack_count);
 }
 
+/* The same list, filled by a title that can compute the word at run time.
+ * The block is a contiguous allocation, so its address depends on allocation
+ * order; a title override that sees the object pointer can name it exactly.
+ * Same caveat as the variable: the DSP never runs the command. */
+void xbox_DspAckAdd(uint32_t va)
+{
+    int i;
+
+    for (i = 0; i < g_dsp_ack_count; i++)
+        if (g_dsp_ack[i] == va)
+            return;
+    if (g_dsp_ack_count >= XBOX_MAX_DSP_ACK)
+        return;
+    g_dsp_ack[g_dsp_ack_count] = va;
+    g_dsp_ack_count++;
+    fprintf(stderr, "  DSP ack: completing command word at 0x%08X\n", va);
+}
+
 static int fence_readable(uint32_t va, uint32_t bytes);  /* defined below */
 
 /* Hold a guest global at a value. A bring-up probe, like the DSP ack.
