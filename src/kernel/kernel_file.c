@@ -832,6 +832,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
     }
 
+    /* A write open of a directory is EISDIR. Hand back a directory fd unless
+     * the caller said the object must be a file. */
+    if (fd < 0 && errno == EISDIR &&
+        !(CreateOptions & XBOX_FILE_NON_DIRECTORY_FILE)) {
+        fd = open(host_path, O_RDONLY | O_DIRECTORY);
+    }
+
     if (fd < 0) {
         int e = errno;
         fprintf(stderr, "  [FILE] miss xbox='%s' host='%s' errno=%d\n",
@@ -925,6 +932,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1036,6 +1044,21 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
             if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
+                return STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+        case XboxFileAllocationInformation: {
+            /* Reserving space. NT leaves EndOfFile alone unless the new
+             * allocation is below it, which truncates; POSIX has no portable
+             * reserve, and the space appears as the caller writes. MechAssault
+             * sizes its Z: cache copy of Common.mgf this way, and the
+             * unimplemented class failed the whole package load. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            struct stat st;
+            if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size &&
+                ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1154,6 +1177,26 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
+/* As on Windows: a search closed before its last entry left its context
+ * keyed by a handle value the next open reuses, and that open's first
+ * query answered STATUS_NO_MORE_FILES from the old, exhausted listing. */
+void xbox_dir_context_drop(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init)
+        return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == FileHandle) {
+            if (s_dir_contexts[i].dir)
+                closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+            s_dir_contexts[i].pattern[0] = '\0';
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -1190,6 +1233,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
         ctx->dir = opendir(dpath);
         if (!ctx->dir) {
+            fprintf(stderr, "  [DIR] cannot list %s (errno %d)\n", dpath, errno);
+            ctx->handle = NULL;
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
@@ -1208,9 +1253,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     struct dirent* de;
     const char* dpath = w32_handle_path(FileHandle);
     struct stat st;
+    int fresh = RestartScan || !ctx->pattern[0] || telldir(ctx->dir) == 0;
     for (;;) {
         de = readdir(ctx->dir);
         if (!de) {
+            if (fresh)
+                fprintf(stderr, "  [DIR] nothing matches '%s' in %s\n",
+                        ctx->pattern, dpath ? dpath : "?");
             closedir(ctx->dir);
             ctx->dir = NULL;
             ctx->handle = NULL;

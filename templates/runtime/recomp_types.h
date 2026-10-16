@@ -932,7 +932,8 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
 #define RECOMP_ABI_CALL(va, fn) do { \
     uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
-    (fn)(); \
+    recomp_func_t _ovr = recomp_lookup_manual((uint32_t)(va)); \
+    if (_ovr) (_ovr)(); else (fn)(); \
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
@@ -941,9 +942,19 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
  * of two situations shows which functions one of them runs and the other does not. */
 void recomp_call_profile_hit(uint32_t va);
-#define RECOMP_ABI_CALL(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
+#define RECOMP_ABI_CALL(va, fn) do { \
+    recomp_call_profile_hit(va); \
+    recomp_func_t _ovr = recomp_lookup_manual((uint32_t)(va)); \
+    if (_ovr) (_ovr)(); else (fn)(); \
+} while(0)
 #else
-#define RECOMP_ABI_CALL(va, fn) (fn)()
+/* A linked D3D is reached by direct calls. The manual table has to win here,
+ * or a replacement in recomp_manual.c only catches indirect calls and the
+ * next relift is the only way to change the function. */
+#define RECOMP_ABI_CALL(va, fn) do { \
+    recomp_func_t _ovr = recomp_lookup_manual((uint32_t)(va)); \
+    if (_ovr) (_ovr)(); else (fn)(); \
+} while(0)
 #endif
 
 /* A guarded arm of an indirect call. When a recorded run saw a call site

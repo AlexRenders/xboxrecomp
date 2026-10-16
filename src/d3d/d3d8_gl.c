@@ -565,11 +565,15 @@ static HRESULT __stdcall dev_GetCreationParameters(IDirect3DDevice8 *s, void *pP
 static HRESULT __stdcall dev_Reset(IDirect3DDevice8 *s, D3DPRESENT_PARAMETERS *pPP)
 { (void)s;(void)pPP; return D3D_OK; }
 
+static void gl_bind_thread(void);
+
 static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const RECT *dst,
                                      HWND hwnd, void *dirty)
 {
     (void)s;(void)src;(void)dst;(void)hwnd;(void)dirty;
-    SDL_GL_SwapWindow(g.window);
+    gl_bind_thread();
+    if (g.window)
+        SDL_GL_SwapWindow(g.window);
     /* Pump events so the window stays responsive. Quit closes the window
      * but leaves the process running until the game's loop notices. */
     SDL_Event ev;
@@ -588,10 +592,19 @@ static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *s, INT i, DWORD t,
 static HRESULT __stdcall dev_BeginScene(IDirect3DDevice8 *s) { (void)s; return D3D_OK; }
 static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *s)   { (void)s; return D3D_OK; }
 
+/* The window is created on the main thread. Draws and presents run on the
+ * title thread, so that thread has to hold the context. */
+static void gl_bind_thread(void)
+{
+    if (g.window && g.glctx)
+        SDL_GL_MakeCurrent(g.window, g.glctx);
+}
+
 static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *s, DWORD count, const D3DRECT *rects,
                                     DWORD flags, D3DCOLOR color, float z, DWORD stencil)
 {
     (void)s; (void)count; (void)rects;
+    gl_bind_thread();
     GLbitfield m = 0;
     if (flags & D3DCLEAR_TARGET) {
         float a = ((color >> 24) & 0xFF) / 255.0f;
@@ -874,6 +887,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *s, D3DPRIMITIVETY
 {
     (void)s;
     if (!verts || prim_count == 0 || stride == 0) return D3D_OK;
+    gl_bind_thread();
     UINT vcount = 0;
     GLenum mode = gl_prim(pt, prim_count, &vcount);
     GLsizeiptr size = (GLsizeiptr)vcount * stride;
@@ -898,6 +912,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *s, D3DPRIM
 {
     (void)s; (void)min_vi;
     if (!verts || !idx || prim_count == 0) return D3D_OK;
+    gl_bind_thread();
     UINT icount = 0;
     GLenum mode = gl_prim(pt, prim_count, &icount);
     GLenum itype = (idx_fmt == D3DFMT_INDEX32) ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
@@ -1340,7 +1355,9 @@ static void host_apply_size(void)
     g.backbuf_w = (int)w;
     g.backbuf_h = (int)h;
     SDL_SetWindowSize(g.window, g.backbuf_w, g.backbuf_h);
+    gl_bind_thread();
     glViewport(0, 0, g.backbuf_w, g.backbuf_h);
+    SDL_GL_MakeCurrent(g.window, NULL);
     fprintf(stderr, "[d3d8_gl] window resized to %ux%u\n", w, h);
 }
 
@@ -1365,19 +1382,112 @@ static void host_pump_events(void)
     }
 }
 
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern int xbox_FramebufferWindowQuery(uint32_t *va, uint32_t *pitch);
+
+static GLuint s_scan_prog, s_scan_tex, s_scan_vao;
+
+static void host_scanout(void)
+{
+    uint32_t va, pitch, width, height, sum, i;
+    const uint8_t *src;
+    static uint32_t logged_va;
+
+    if (!g.window || !g.glctx)
+        return;
+    if (!xbox_FramebufferWindowQuery(&va, &pitch) || pitch < 8)
+        return;
+    width = pitch / 4u;
+    if (width < 16 || width > 1920)
+        return;
+    height = 480;
+    src = (const uint8_t *)((uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset());
+    if (va != logged_va) {
+        uint32_t nonzero = 0;
+        sum = 0;
+        for (i = 0; i < pitch * height; i++) {
+            sum += src[i];
+            nonzero += src[i] != 0;
+        }
+        fprintf(stderr, "[d3d8_gl] scanout va=0x%08X %ux%u sum=%u nonzero=%u\n",
+                va, width, height, sum, nonzero);
+        logged_va = va;
+    }
+    gl_bind_thread();
+    if (!s_scan_prog) {
+        static const char *vs_src =
+            "#version 330 core\n"
+            "layout(location=0) in vec2 a_pos;\n"
+            "layout(location=1) in vec2 a_uv;\n"
+            "out vec2 v_uv;\n"
+            "void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+        static const char *fs_src =
+            "#version 330 core\n"
+            "in vec2 v_uv;\n"
+            "uniform sampler2D u_tex;\n"
+            "out vec4 frag;\n"
+            "void main() { frag = texture(u_tex, v_uv); }\n";
+        static const float quad[] = {
+            -1.f, -1.f, 0.f, 1.f,
+             1.f, -1.f, 1.f, 1.f,
+            -1.f,  1.f, 0.f, 0.f,
+             1.f,  1.f, 1.f, 0.f,
+        };
+        GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
+        GLuint vbo = 0;
+        s_scan_prog = (vs && fs) ? link_program(vs, fs) : 0;
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        if (!s_scan_prog)
+            return;
+        glGenVertexArrays(1, &s_scan_vao);
+        glGenBuffers(1, &vbo);
+        glBindVertexArray(s_scan_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, (void *)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void *)8);
+        glGenTextures(1, &s_scan_tex);
+        glBindTexture(GL_TEXTURE_2D, s_scan_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g.backbuf_w > 0 ? g.backbuf_w : (GLsizei)width,
+                     g.backbuf_h > 0 ? g.backbuf_h : (GLsizei)height);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glUseProgram(s_scan_prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_scan_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height,
+                 0, GL_BGRA, GL_UNSIGNED_BYTE, src);
+    glUniform1i(glGetUniformLocation(s_scan_prog, "u_tex"), 0);
+    glBindVertexArray(s_scan_vao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    SDL_GL_SwapWindow(g.window);
+    SDL_GL_MakeCurrent(g.window, NULL);
+}
+
 void d3d8_HostMainLoop(volatile int *done)
 {
     if (!g.window)
         host_create_window(640, 480);
     g_host_loop = 1;
     fprintf(stderr, "[d3d8_gl] main thread owns the window\n");
+    /* Present is the only swap. Clearing here erased whatever the title drew.
+     * The context is released so the title thread can bind it. */
+    if (g.window && g.glctx)
+        SDL_GL_MakeCurrent(g.window, NULL);
     while (!done || !*done) {
         host_pump_events();
         host_apply_size();
-        if (g.window)
-            host_present_clear();
-        else
-            SDL_Delay(16);
+        host_scanout();
+        SDL_Delay(16);
     }
     g_host_loop = 0;
 }

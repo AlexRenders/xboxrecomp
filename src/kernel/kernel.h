@@ -511,6 +511,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
+void xbox_kernel_reset_boot(void);
 
 /**
  * Per-title kernel ordinal remap.
@@ -672,6 +673,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
+void xbox_dir_context_drop(HANDLE FileHandle);
 #ifdef _WIN32
 void xbox_dir_context_drop(HANDLE FileHandle);
 #endif
@@ -888,6 +890,7 @@ NTSTATUS __stdcall xbox_IoCreateSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName,
 /* Target of a link registered by xbox_IoCreateSymbolicLink, or NULL.
  * Looked up by exact link name, e.g. "\\??\\Z:". */
 const char* xbox_LookupSymbolicLink(const char* link);
+void xbox_symlinks_reset(void);
 NTSTATUS __stdcall xbox_IoDeleteSymbolicLink(PXBOX_ANSI_STRING SymbolicLinkName);
 
 /* ============================================================================

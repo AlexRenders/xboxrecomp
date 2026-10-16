@@ -107,3 +107,42 @@ Until those replacements exist, the order that produces a picture is:
 
 `libxbox_d3d8` builds with the translator on this Mac. That build does not
 mean a title has reached `DrawPrimitive`.
+
+## Kernel and device fixes from the first full POSIX boot
+
+These came out of booting a title end to end on Apple Silicon. None of them
+name a title.
+
+- **Vblank delivery.** An ISR registered with `KeConnectInterrupt` is often
+  reached only through that pointer, so the disassembler never seeds it. The
+  title must lift it and return it from `recomp_lookup_manual`. The toolkit
+  should seed functions from `KeInitializeInterrupt`, `KeInitializeDpc` and
+  thread-start pointers instead.
+- **Events without a host shadow.** `KeSetEvent`, `KePulseEvent` and
+  `KeResetEvent` on a guest `KEVENT` that has no host object now update
+  `SignalState` in guest memory. Calling host `SetEvent` on a guest pointer
+  crashed.
+- **Directory handles.** POSIX directory scan state was keyed by handle and
+  never dropped on `NtClose`. A reused handle number inherited a finished
+  scan, and `FindFirstFile` returned "no more files" for a file that exists.
+  `xbox_dir_context_drop` runs on every close now.
+- **File info classes.** POSIX `NtSetInformationFile` handles rename (class
+  10) and allocation size (class 19). Cache builders use both.
+- **Relaunch.** `XLaunchNewImage` reboots in-process. A reboot now parks
+  threads from the previous boot, clears connected ISRs and queued DPCs, and
+  rewinds the heap and contiguous allocators to their post-load snapshot
+  (`xbox_MemorySaveAllocators` / `xbox_MemoryRestoreAllocators`). Without
+  the rewind, memory leaked until the fourth boot failed. Titles that
+  rebuild a cache relaunch more than once, so the host must not cap that at one.
+- **AC'97 codec ready.** DirectSound polls `0xFEC00130` bit 8. If it never
+  sets, `DirectSoundCreate` returns `DSERR_NODRIVER`, and some titles treat
+  that as fatal before any front end exists: no menu object, then a
+  relaunch loop. `RECOMP_AC97_READY` sets the bit. On POSIX it no longer
+  traps the APU pages, because the MMIO decoder (`src/apu/apu_mmio_hook.c`)
+  is a Windows VEH and a trapped page there is just a crash.
+- **Still open on POSIX:** the AC'97 bus-master reset. DirectSound writes RR
+  (bit 1) to a channel control byte at NABM `+0x0B`, reads it once (the
+  compiler hoisted the load), and spins on that value. The Windows answer is
+  the write trap in `xbox_memory_layout.c`. POSIX has no fault router for
+  it yet, so a title has to replace the function that does the reset, or
+  the toolkit needs a SIGSEGV/Mach handler that single-steps guest writes.

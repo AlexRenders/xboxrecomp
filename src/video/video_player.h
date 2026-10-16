@@ -65,6 +65,8 @@ int xbox_FramebufferKeyDown(int vk);
 
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+/* 1 when AvSetDisplayMode has named a framebuffer. va is the CPU address. */
+int xbox_FramebufferWindowQuery(uint32_t *va, uint32_t *pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
  * UTF-16 title (40 chars max); the stats come from each flip. */

@@ -127,6 +127,9 @@ void xbox_SetTotalRam(size_t bytes);
  * @return TRUE on success, FALSE on failure.
  */
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
+/* Copy the XBE sections over guest RAM again. Mappings stay. Used when a
+ * title reboots into the same image and must see its original globals. */
+BOOL xbox_MemoryLayoutReload(const void *xbe_data, size_t xbe_size);
 
 /**
  * Release the reserved Xbox memory layout.
@@ -187,6 +190,11 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+
+/* Snapshot the heap, contiguous and thread-stack allocators before the title
+ * first runs; a relaunch rewinds them there, as a reboot clears RAM. */
+void xbox_MemorySaveAllocators(void);
+void xbox_MemoryRestoreAllocators(void);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,

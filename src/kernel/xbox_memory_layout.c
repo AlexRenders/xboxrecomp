@@ -1704,6 +1704,48 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+BOOL xbox_MemoryLayoutReload(const void *xbe_data, size_t xbe_size)
+{
+    const uint8_t *xbe = (const uint8_t *)xbe_data;
+    DWORD base_addr, num_sections, sect_headers_va, sect_headers_off, si;
+
+    if (!g_memory_base || !xbe || xbe_size < 0x124)
+        return FALSE;
+
+    base_addr = *(const DWORD *)(xbe + XBE_BASE_ADDR_OFFSET);
+    num_sections = *(const DWORD *)(xbe + XBE_SECTION_COUNT_OFFSET);
+    sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
+    if (sect_headers_va < base_addr)
+        return FALSE;
+    sect_headers_off = sect_headers_va - base_addr;
+    if (num_sections > 64)
+        num_sections = 64;
+
+    for (si = 0; si < num_sections; si++) {
+        const uint8_t *sh;
+        DWORD sec_va, sec_vsize, sec_raw_off, sec_raw_size, copy_size;
+
+        if (sect_headers_off + (si + 1) * SECTHDR_SIZE > xbe_size)
+            break;
+        sh = xbe + sect_headers_off + si * SECTHDR_SIZE;
+        sec_va = *(const DWORD *)(sh + SECTHDR_VA);
+        sec_vsize = *(const DWORD *)(sh + SECTHDR_VSIZE);
+        sec_raw_off = *(const DWORD *)(sh + SECTHDR_RAW_OFFSET);
+        sec_raw_size = *(const DWORD *)(sh + SECTHDR_RAW_SIZE);
+        if (sec_va < XBOX_BASE_ADDRESS ||
+            (size_t)sec_va + sec_vsize > g_xbox_total_ram || sec_vsize == 0)
+            continue;
+        copy_size = sec_raw_size < sec_vsize ? sec_raw_size : sec_vsize;
+        memset((void *)((uintptr_t)sec_va + g_memory_offset), 0, sec_vsize);
+        if (copy_size && sec_raw_off + copy_size <= xbe_size) {
+            memcpy((void *)((uintptr_t)sec_va + g_memory_offset),
+                   xbe + sec_raw_off, copy_size);
+        }
+    }
+    fprintf(stderr, "[mem] reloaded %u XBE sections\n", num_sections);
+    return TRUE;
+}
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
@@ -2423,11 +2465,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * rep movsd, which the lifter lowers to a host memcpy, and
                  * that faulted at 0xFE830B78 with no way to resume. Plain
                  * memory keeps what the title writes. */
+                /* Windows only: the MMIO decoder in src/apu/apu_mmio_hook.c
+                 * is a VEH, and POSIX has no fault router for it yet. There a
+                 * trapped page is just a crash on the first register access,
+                 * so the APU stays plain memory with the sample counter
+                 * ticking, as it does without the variable. */
                 enum { APU_TRAP_BYTES = 0x00030000 };
+#if defined(_WIN32)
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
+#endif
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
                                     " (GP/EP DSP memory left as RAM)\n",
@@ -3081,6 +3130,66 @@ static uint32_t g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
 static struct { uint32_t addr, size; int free; } g_contig_blocks[CONTIG_MAX_BLOCKS];
 static int g_contig_block_count;
 static SRWLOCK g_contig_lock = SRWLOCK_INIT;
+
+/* Allocator state as it stood before the title ran, for a relaunch.
+ *
+ * XLaunchNewImage reboots the console, and a reboot clears RAM. Without the
+ * rewind every boot starts where the last one stopped: MechAssault reboots
+ * itself between stages, each boot took another ~12 MB, and the fourth ran
+ * the 48 MB heap dry and fell back to the dashboard. */
+static struct {
+    int      saved;
+    uint32_t heap_next, contig_next;
+    int      heap_block_count, contig_block_count, thread_stacks_used;
+    void    *heap_blocks, *contig_blocks;
+} g_alloc_snap;
+
+static void *snap_copy(void *old, const void *src, size_t n)
+{
+    void *p;
+    free(old);
+    if (!n || !(p = malloc(n)))
+        return NULL;
+    memcpy(p, src, n);
+    return p;
+}
+
+void xbox_MemorySaveAllocators(void)
+{
+    g_alloc_snap.heap_next          = g_heap_next;
+    g_alloc_snap.contig_next        = g_contig_next;
+    g_alloc_snap.heap_block_count   = g_heap_block_count;
+    g_alloc_snap.contig_block_count = g_contig_block_count;
+    g_alloc_snap.thread_stacks_used = g_thread_stacks_used;
+    g_alloc_snap.heap_blocks = snap_copy(g_alloc_snap.heap_blocks, g_heap_blocks,
+        (size_t)g_heap_block_count * sizeof g_heap_blocks[0]);
+    g_alloc_snap.contig_blocks = snap_copy(g_alloc_snap.contig_blocks, g_contig_blocks,
+        (size_t)g_contig_block_count * sizeof g_contig_blocks[0]);
+    g_alloc_snap.saved = 1;
+}
+
+/* Callers must have stopped every guest thread of the previous boot first:
+ * their stacks and TIBs are heap blocks, and this hands those out again. */
+void xbox_MemoryRestoreAllocators(void)
+{
+    if (!g_alloc_snap.saved)
+        return;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    g_heap_next        = g_alloc_snap.heap_next;
+    g_heap_block_count = g_alloc_snap.heap_block_count;
+    if (g_alloc_snap.heap_blocks)
+        memcpy(g_heap_blocks, g_alloc_snap.heap_blocks,
+               (size_t)g_heap_block_count * sizeof g_heap_blocks[0]);
+    g_thread_stacks_used = g_alloc_snap.thread_stacks_used;
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    AcquireSRWLockExclusive(&g_contig_lock);
+    g_contig_next        = g_alloc_snap.contig_next;
+    g_contig_block_count = g_alloc_snap.contig_block_count;
+    if (g_alloc_snap.contig_blocks)
+        memcpy(g_contig_blocks, g_alloc_snap.contig_blocks,
+               (size_t)g_contig_block_count * sizeof g_contig_blocks[0]);
+    ReleaseSRWLockExclusive(&g_contig_lock);
+}
 
 static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
 {

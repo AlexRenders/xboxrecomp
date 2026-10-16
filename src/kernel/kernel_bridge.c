@@ -43,6 +43,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <wctype.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 /* Access to recompiled code registers. Per-thread: RECOMP_TLS comes from
  * xbox_memory_layout.h and must match the definitions there -- a plain extern
@@ -442,11 +445,49 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  */
 static int g_thread_call_count = 0;
 
+/* Which boot a spawned guest thread belongs to. A reboot ends every thread;
+ * here they are host threads that cannot be killed, so one from an earlier
+ * boot parks at its next kernel call instead of running on in memory the new
+ * boot is reusing. */
+static volatile LONG g_boot_generation = 0;
+static RECOMP_TLS LONG g_thread_generation = 0;
+static RECOMP_TLS int g_is_spawned_thread;
+
+static void park_if_previous_boot(void)
+{
+    if (!g_is_spawned_thread || g_thread_generation == g_boot_generation)
+        return;
+    fprintf(stderr, "  [KERNEL] thread from boot %ld parked\n",
+            (long)g_thread_generation);
+    fflush(stderr);
+    for (;;)
+        Sleep(1000000);
+}
+
+static void kernel_reset_irq_state(void);   /* with the DPC queue, below */
+
+/* A relaunch of the same image is a new boot. The first
+ * PsCreateSystemThreadEx of a boot is the game, run on the calling thread.
+ * Leaving the counter where the previous boot stopped makes that call a
+ * worker, the entry returns, and the process tears the image down under it.
+ *
+ * The rest is what a reboot clears: the previous boot's threads, its queued
+ * DPCs and connected interrupts, and its memory. Must run on the title's
+ * main thread, which carries on as the new boot. */
+void xbox_kernel_reset_boot(void)
+{
+    g_thread_call_count = 0;
+    xbox_symlinks_reset();
+    InterlockedIncrement(&g_boot_generation);
+    kernel_reset_irq_state();
+    xbox_MemoryRestoreAllocators();
+}
+
 /* Thread entry shim. Sets up the new thread's own simulated stack, pushes the
  * two Xbox start-context arguments plus the dummy return address the callee's
  * `ret` consumes, and runs. */
-/* Set on threads this bridge spawned; see PsTerminateSystemThread. */
-static RECOMP_TLS int g_is_spawned_thread = 0;
+/* g_is_spawned_thread (above) is set on threads this bridge spawned; see
+ * PsTerminateSystemThread. */
 
 /* This thread's simulated stack, so both exits can give it back. Thread-local
  * for the obvious reason, and needed at all because the common exit is
@@ -488,6 +529,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    g_thread_generation = g_boot_generation;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -683,9 +725,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
-#ifdef _WIN32
             xbox_dir_context_drop(h);
-#endif
             CloseHandle(h);
         }
     }
@@ -1349,11 +1389,36 @@ static void bridge_HalReturnToFirmware(void)
 
     /* Bring-up only. A title that cannot find xonlinedash.xbe reboots to the
      * system dashboard. Returning lets that caller keep going so the campaign
-     * path can be seen. A real quit still ends the process when this is unset. */
+     * path can be seen. A real quit still ends the process when this is unset.
+     *
+     * Routine 2 with a path is XLaunchNewImage, not a quit. A title supplies
+     * recomp_RelaunchImage to start that image; the weak default does nothing
+     * and the caller is returned to, as before. */
     if (getenv("RECOMP_NO_EXIT")) {
+        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+        char path[64];
+        uint32_t i;
+
+        path[0] = 0;
+        if (page && routine == 2) {
+            for (i = 0; i < sizeof(path) - 1; i++) {
+                uint8_t c = BRIDGE_MEM8(page + 8 + i);
+                if (!c) break;
+                path[i] = (char)c;
+            }
+            path[i] = 0;
+        }
         fprintf(stderr, "  [KERNEL] RECOMP_NO_EXIT set; returning to the title\n");
         fflush(stderr);
         g_eax = 0;
+        if (path[0]) {
+            extern void recomp_RelaunchImage(const char *path) __attribute__((weak));
+            if (recomp_RelaunchImage) {
+                fprintf(stderr, "  [KERNEL] relaunch '%s'\n", path);
+                fflush(stderr);
+                recomp_RelaunchImage(path);
+            }
+        }
         return;
     }
 
@@ -1545,10 +1610,15 @@ static void bridge_KeSetEvent(void)
         }
     }
     h = ke_shadow_lookup(guest_va);
+    /* Below the handle tag a KEVENT is guest memory, not a host event: the
+     * POSIX SetEvent dereferences whatever it is given. Set SignalState. */
+    if (!h && guest_va && guest_va < 0x48000000u) {
+        g_eax = BRIDGE_MEM32(guest_va + 4) != 0;
+        BRIDGE_MEM32(guest_va + 4) = 1;
+        return;
+    }
     if (!h)
         h = bridge_resolve_handle(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
     if (h)
         g_eax = (uint32_t)SetEvent(h);
     else
@@ -1588,10 +1658,20 @@ static void bridge_KeWaitForSingleObject(void)
     }
 
     h = ke_shadow_lookup(object);
+    /* Below the handle tag (0x48000000) this is a guest address.
+     * bridge_resolve_handle would pass it through, and the host wait
+     * dereferences it. A D3D fence is one of these: the graphics
+     * interrupt is what signals it, and that interrupt does not run. */
+    if (!h && object < 0x48000000u) {
+        static int shown;
+        if (shown++ < 8)
+            fprintf(stderr, "  [KERNEL] KeWait 0x%08X has no host object; "
+                            "treated as signalled\n", object);
+        g_eax = 0;
+        return;
+    }
     if (!h)
         h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
 
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
@@ -2438,6 +2518,14 @@ static void bridge_KeConnectInterrupt(void)
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector)
 {
     return (vector < XBOX_MAX_VECTORS) ? g_connected_isr[vector] : 0;
+}
+
+static void kernel_reset_irq_state(void)
+{
+    memset(g_connected_isr, 0, sizeof g_connected_isr);
+    dpc_lock();
+    g_dpc_head = g_dpc_tail;
+    LeaveCriticalSection(&g_dpc_lock);
 }
 
 /* ── MmClaimGpuInstanceMemory (ordinal 168) ───────────────
@@ -3552,6 +3640,41 @@ static void bridge_NtSetInformationFile(void)
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
         return;
     }
+#ifndef _WIN32
+    /* FileRenameInformation: { BOOLEAN ReplaceIfExists; HANDLE RootDirectory;
+     * OBJECT_STRING FileName } -- the name is a guest pointer, so it is read
+     * here rather than in kernel_file.c. MechAssault writes its Z: cache copy
+     * as filecopy.tmp and renames it into place. */
+    if (infoclass == XboxFileRenameInformation && length >= 16) {
+        uint16_t    n       = BRIDGE_MEM16(info_va + 8);
+        uint32_t    buf     = BRIDGE_MEM32(info_va + 12);
+        BOOLEAN     replace = BRIDGE_MEM8(info_va) != 0;
+        const char *from    = w32_handle_path(handle);
+        char        name[MAX_PATH], to[MAX_PATH];
+        struct stat st;
+        NTSTATUS    s;
+
+        if (!from || !buf || !n || n >= sizeof(name)) {
+            s = STATUS_INVALID_PARAMETER;
+        } else {
+            memcpy(name, XBOX_TO_NATIVE(buf), n);
+            name[n] = '\0';
+            if (!xbox_translate_path(name, to, sizeof(to)))
+                s = STATUS_OBJECT_PATH_NOT_FOUND;
+            else if (!replace && stat(to, &st) == 0)
+                s = STATUS_OBJECT_NAME_COLLISION;
+            else if (rename(from, to) != 0)
+                s = STATUS_UNSUCCESSFUL;
+            else {
+                w32_handle_set_path(handle, to);
+                s = STATUS_SUCCESS;
+            }
+        }
+        bridge_write_iostatus(ios_va, s, 0);
+        g_eax = (uint32_t)s;
+        return;
+    }
+#endif
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -7040,6 +7163,11 @@ static void bridge_KePulseEvent(void)
         }
     }
     h = ke_shadow_lookup(guest_va);
+    if (!h && guest_va && guest_va < 0x48000000u) {
+        BRIDGE_MEM32(guest_va + 4) = 0;            /* see bridge_KeSetEvent */
+        g_eax = 0;
+        return;
+    }
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
@@ -7108,6 +7236,11 @@ static void bridge_KeResetEvent(void)
         }
     }
     h = ke_shadow_lookup(guest_va);
+    if (!h && guest_va && guest_va < 0x48000000u) {
+        g_eax = BRIDGE_MEM32(guest_va + 4) != 0;   /* see bridge_KeSetEvent */
+        BRIDGE_MEM32(guest_va + 4) = 0;
+        return;
+    }
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     if (h)
@@ -9444,6 +9577,7 @@ static void kernel_thunk_dispatch_body(void)
         return;
     }
 
+    park_if_previous_boot();
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 

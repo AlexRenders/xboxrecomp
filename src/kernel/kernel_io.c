@@ -334,6 +334,14 @@ typedef struct _XBOX_SYMLINK {
 
 static XBOX_SYMLINK g_symlinks[XBOX_MAX_SYMLINKS];
 
+/* A relaunch is a new boot. The console's link table is empty after one, and
+ * a title that mounts T: and U: again treats "already exists" as a failed
+ * hard disk and reboots to the dashboard. */
+void xbox_symlinks_reset(void)
+{
+    memset(g_symlinks, 0, sizeof(g_symlinks));
+}
+
 /* Copy a counted, non-NUL-terminated ANSI_STRING into a C buffer. */
 static void xbox_copy_ansi(char* dst, size_t dst_size, PXBOX_ANSI_STRING src)
 {

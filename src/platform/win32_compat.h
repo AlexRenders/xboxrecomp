@@ -127,6 +127,7 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
+void        w32_handle_set_path(HANDLE h, const char *host_path);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);

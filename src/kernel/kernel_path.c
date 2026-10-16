@@ -55,7 +55,9 @@ static const path_rule s_rules[] = {
      * partition0 at startup and treats the failure as fatal.
      *
      * No trailing separator: the probe opens the device itself, with nothing
-     * after it. Listed after Partition1 so that keeps its own mapping. */
+     * after it. The bare device is an image file, matched before this table
+     * on both platforms, because the title reads the partition table at
+     * sector 4 and a directory cannot answer that read. */
     /* Partition2 is C:, the system partition. On a console that is where the
      * dashboard and its own assets live, and the dashboard opens them by
      * device path as well as through Y:, so a path *under* partition2 is an
@@ -482,12 +484,86 @@ translate:
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
 
-static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
+static void mkdir_p(const char* path);
+
+/*
+ * The raw disk device, \Device\Harddisk0\PartitionN, with nothing under it.
+ *
+ * Same contract as the Windows image above. The title reads 512 bytes at
+ * offset 0x800 and looks for the retail partition table; a directory open
+ * returns EISDIR or a zero-length read, and the title reboots to the
+ * dashboard. Partition0 carries that table. The other bare devices are empty
+ * files so the open itself succeeds.
+ */
+static int posix_partition_device(const char *xbox_path, char *out, size_t n)
+{
+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
+    int len = match_prefix(xbox_path, prefix);
+    int digit;
+    const char *rest;
+
+    if (!len)
+        return 0;
+    digit = xbox_path[len];
+    if (digit < '0' || digit > '9')
+        return 0;
+    /* A trailing separator is the filesystem root (Partition1\ is the game
+     * directory), not the raw device. Only the bare name is the image. */
+    rest = xbox_path + len + 1;
+    if (*rest != '\0')
+        return 0;
+    snprintf(out, n, "%s/Partition%c.img", s_save_dir, digit);
+    return 1;
+}
+
+static void posix_write_partition_table(const char *path)
+{
+    static const struct { const char *name; unsigned start, size; } parts[] = {
+        { "XBOX_PART_X",  0x00000400u, 0x00177000u },
+        { "XBOX_PART_Y",  0x00177400u, 0x00177000u },
+        { "XBOX_PART_Z",  0x002EE400u, 0x00177000u },
+        { "XBOX_PART_C",  0x00465400u, 0x000FA000u },
+        { "XBOX_PART_E",  0x0055F400u, 0x00465400u },
+    };
+    unsigned char sector[512];
+    FILE *f;
+    size_t i;
+
+    mkdir_p(s_save_dir);
+    f = fopen(path, "r+b");
+    if (!f)
+        f = fopen(path, "w+b");
+    if (!f)
+        return;
+    memset(sector, 0, sizeof(sector));
+    memcpy(sector, "****PARTINFO****", 16);
+    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        unsigned char *e = sector + 48 + i * 32;
+        size_t nlen = strlen(parts[i].name);
+        memset(e, ' ', 16);
+        memcpy(e, parts[i].name, nlen < 16 ? nlen : 16);
+        e[16] = 0x00; e[17] = 0x00; e[18] = 0x00; e[19] = 0x80;
+        e[20] = (unsigned char)(parts[i].start);
+        e[21] = (unsigned char)(parts[i].start >> 8);
+        e[22] = (unsigned char)(parts[i].start >> 16);
+        e[23] = (unsigned char)(parts[i].start >> 24);
+        e[24] = (unsigned char)(parts[i].size);
+        e[25] = (unsigned char)(parts[i].size >> 8);
+        e[26] = (unsigned char)(parts[i].size >> 16);
+        e[27] = (unsigned char)(parts[i].size >> 24);
+    }
+    if (fseek(f, 0x800, SEEK_SET) == 0)
+        fwrite(sector, 1, sizeof(sector), f);
+    fclose(f);
+}
+
+static char s_game_dir[MAX_PATH];
 static BOOL s_initialized = FALSE;
 
 /* Strip a single trailing '/' (but never the root '/'). */
@@ -570,6 +646,20 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
+    }
+
+    if (posix_partition_device(xbox_path, host_path_buf, buf_size)) {
+        struct stat st;
+        mkdir_p(s_save_dir);
+        if (host_path_buf[0] && strstr(host_path_buf, "Partition0.img") &&
+            (stat(host_path_buf, &st) != 0 || st.st_size < 0xA00))
+            posix_write_partition_table(host_path_buf);
+        else if (stat(host_path_buf, &st) != 0) {
+            FILE *f = fopen(host_path_buf, "wb");
+            if (f)
+                fclose(f);
+        }
+        return TRUE;
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {

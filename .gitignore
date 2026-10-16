@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.pydeps/
 
 # Tool output (regenerated per-game)
 tools/disasm/output/

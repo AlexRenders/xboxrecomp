@@ -42,6 +42,17 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 
+int xbox_FramebufferWindowQuery(uint32_t *va, uint32_t *pitch)
+{
+    if (!s_fb_va || !s_fb_pitch)
+        return 0;
+    if (va)
+        *va = s_fb_va;
+    if (pitch)
+        *pitch = s_fb_pitch;
+    return 1;
+}
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
@@ -391,8 +402,29 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+static uint32_t s_fb_va, s_fb_pitch;
+
+int xbox_FramebufferWindowQuery(uint32_t *va, uint32_t *pitch)
+{
+    if (!s_fb_va || !s_fb_pitch)
+        return 0;
+    if (va)
+        *va = s_fb_va;
+    if (pitch)
+        *pitch = s_fb_pitch;
+    return 1;
+}
+
+static void fb_note(uint32_t fb_va, uint32_t pitch)
+{
+    if (fb_va)
+        s_fb_va = fb_va;
+    if (pitch)
+        s_fb_pitch = pitch;
+}
+
+void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { fb_note(fb_va, pitch); }
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { fb_note(fb_va, pitch); }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
